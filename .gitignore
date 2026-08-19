@@ -1,0 +1,10 @@
+config.h
+nodes.json
+.vscode/
+.idea/
+*.bin
+*.elf
+*.map
+__pycache__/
+*.pyc
+.env

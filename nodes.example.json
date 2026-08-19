@@ -1,0 +1,26 @@
+{
+  "mqtt": {
+    "broker": "192.168.1.10",
+    "port": 1883,
+    "user": "",
+    "password": "",
+    "client_id": "wall-switch-bridge"
+  },
+  "ping": {
+    "interval_s": 0.1,
+    "timeout_ms": 80,
+    "hits_to_switch": 3
+  },
+  "nodes": [
+    {
+      "id": "office",
+      "name": "Office Wall Switch",
+      "host": "192.168.1.150"
+    },
+    {
+      "id": "bedroom",
+      "name": "Bedroom Wall Switch",
+      "host": "192.168.1.151"
+    }
+  ]
+}

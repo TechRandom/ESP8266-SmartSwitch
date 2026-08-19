@@ -1,0 +1,15 @@
+services:
+  wall-switch-bridge:
+    image: python:3.12-alpine
+    container_name: wall-switch-bridge
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - ./:/app:ro
+    working_dir: /app
+    command: >
+      sh -c "apk add --no-cache iputils >/dev/null
+      && pip install --no-cache-dir -r requirements.txt >/dev/null
+      && python -u ping_mqtt_bridge.py"
