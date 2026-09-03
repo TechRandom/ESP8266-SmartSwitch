@@ -7,9 +7,12 @@
     "client_id": "wall-switch-bridge"
   },
   "ping": {
-    "interval_s": 0.1,
-    "timeout_ms": 80,
-    "hits_to_switch": 3
+    "interval_s": 0.3,
+    "timeout_ms": 250,
+    "probes": 1,
+    "hits_to_on": 3,
+    "off_window_s": 5,
+    "min_on_s": 2
   },
   "nodes": [
     {
