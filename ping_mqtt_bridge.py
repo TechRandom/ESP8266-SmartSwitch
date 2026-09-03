@@ -1,8 +1,11 @@
 """
 Ping wall-switch ESP8266 nodes and publish ON/OFF to MQTT on state changes.
 
-3 successful pings in a row -> ON
-3 missed pings in a row     -> OFF
+A few successful pings in a row -> ON
+OFF only after a long window with zero successful pings.
+
+A node stays ON if it answers at all during the off window, so brief Wi-Fi
+or ARP dropouts do not flicker lights. Real offs are slower by design.
 
 Edit nodes.json to add rooms. Each node needs a unique id and static IP.
 
@@ -50,9 +53,12 @@ class MqttSettings:
 
 @dataclass
 class PingSettings:
-    interval_s: float = 0.1
-    timeout_ms: int = 80
-    hits_to_switch: int = 3
+    interval_s: float = 0.3
+    timeout_ms: int = 250
+    probes: int = 1
+    hits_to_on: int = 3
+    off_window_s: float = 5.0
+    min_on_s: float = 2.0
 
 
 @dataclass
@@ -62,8 +68,10 @@ class Node:
     host: str
     topic: str
     consecutive_ok: int = 0
-    consecutive_fail: int = 0
     state: str | None = None
+    last_on_at: float | None = None
+    last_success_at: float | None = None
+    first_seen_at: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -85,10 +93,20 @@ def load_config(path: Path) -> tuple[MqttSettings, PingSettings, list[Node]]:
         password=str(mqtt_raw.get("password", "")),
         client_id=str(mqtt_raw.get("client_id", "wall-switch-bridge")),
     )
+    legacy_hits = ping_raw.get("hits_to_switch")
+    if "off_window_s" in ping_raw:
+        off_window_s = float(ping_raw["off_window_s"])
+    elif "off_confirm_s" in ping_raw:
+        off_window_s = max(float(ping_raw["off_confirm_s"]), 5.0)
+    else:
+        off_window_s = 5.0
     ping_settings = PingSettings(
-        interval_s=float(ping_raw.get("interval_s", 0.1)),
-        timeout_ms=int(ping_raw.get("timeout_ms", 80)),
-        hits_to_switch=int(ping_raw.get("hits_to_switch", 3)),
+        interval_s=float(ping_raw.get("interval_s", 0.3)),
+        timeout_ms=int(ping_raw.get("timeout_ms", 250)),
+        probes=max(1, int(ping_raw.get("probes", 1))),
+        hits_to_on=int(ping_raw.get("hits_to_on", legacy_hits if legacy_hits is not None else 3)),
+        off_window_s=off_window_s,
+        min_on_s=float(ping_raw.get("min_on_s", 2.0)),
     )
 
     nodes: list[Node] = []
@@ -121,24 +139,32 @@ def load_config(path: Path) -> tuple[MqttSettings, PingSettings, list[Node]]:
 
 
 def ping_once(host: str, timeout_ms: int) -> bool:
+    timeout_s = max(timeout_ms / 1000.0, 0.05)
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
     else:
-        timeout_s = max(timeout_ms / 1000.0, 0.05)
-        cmd = ["ping", "-c", "1", "-W", str(timeout_s), host]
+        cmd = ["ping", "-c", "1", "-W", f"{timeout_s:.3f}", host]
 
     try:
         result = subprocess.run(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=max(timeout_ms / 1000.0, 0.2) + 0.4,
+            timeout=timeout_s + 0.15,
             check=False,
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError) as exc:
         log.debug("Ping error for %s: %s", host, exc)
         return False
+
+
+def ping_check(host: str, timeout_ms: int, probes: int) -> bool:
+    """A check succeeds if any probe gets a reply."""
+    for _ in range(probes):
+        if ping_once(host, timeout_ms):
+            return True
+    return False
 
 
 def discovery_topic(node: Node) -> str:
@@ -222,32 +248,51 @@ class Bridge:
         log.info("%s -> %s", node.topic, state)
 
     def watch_node(self, node: Node) -> None:
-        hits = self.ping_settings.hits_to_switch
-        log.info("Watching %s (%s) every %sms", node.name, node.host, int(self.ping_settings.interval_s * 1000))
+        settings = self.ping_settings
+        log.info(
+            "Watching %s (%s) every %sms (on after %s hits, off %.0fs after last reply)",
+            node.name,
+            node.host,
+            int(settings.interval_s * 1000),
+            settings.hits_to_on,
+            settings.off_window_s,
+        )
 
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
-                alive = ping_once(node.host, self.ping_settings.timeout_ms)
+                alive = ping_check(node.host, settings.timeout_ms, settings.probes)
             except Exception:
                 log.exception("Unexpected ping failure for %s", node.node_id)
                 alive = False
 
+            now = time.monotonic()
             with node.lock:
+                if node.first_seen_at is None:
+                    node.first_seen_at = now
                 if alive:
+                    node.last_success_at = now
                     node.consecutive_ok += 1
-                    node.consecutive_fail = 0
-                    if node.consecutive_ok >= hits and node.state != "ON":
+                    if node.consecutive_ok >= settings.hits_to_on and node.state != "ON":
                         node.state = "ON"
+                        node.last_on_at = now
                         self.publish_state(node, node.state)
                 else:
-                    node.consecutive_fail += 1
                     node.consecutive_ok = 0
-                    if node.consecutive_fail >= hits and node.state != "OFF":
-                        node.state = "OFF"
-                        self.publish_state(node, node.state)
 
-            remaining = self.ping_settings.interval_s - (time.monotonic() - started)
+                reference = node.last_success_at if node.last_success_at is not None else node.first_seen_at
+                held_on = node.last_on_at is not None and (now - node.last_on_at) < settings.min_on_s
+                if (
+                    node.state != "OFF"
+                    and not alive
+                    and not held_on
+                    and reference is not None
+                    and now - reference >= settings.off_window_s
+                ):
+                    node.state = "OFF"
+                    self.publish_state(node, node.state)
+
+            remaining = settings.interval_s - (time.monotonic() - started)
             if remaining > 0:
                 self.stop_event.wait(remaining)
 
@@ -305,6 +350,13 @@ def main() -> int:
         return 1
 
     log.info("Loaded %s node(s) from %s", len(nodes), CONFIG_PATH)
+    log.info(
+        "Ping every %sms, timeout %sms, on after %s hits, off %.0fs after last reply",
+        int(ping_settings.interval_s * 1000),
+        ping_settings.timeout_ms,
+        ping_settings.hits_to_on,
+        ping_settings.off_window_s,
+    )
     bridge = Bridge(mqtt_settings, ping_settings, nodes)
     signal.signal(signal.SIGINT, bridge.request_stop)
     signal.signal(signal.SIGTERM, bridge.request_stop)

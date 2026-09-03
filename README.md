@@ -9,7 +9,7 @@ Wall switch ON  -> ESP boots, joins Wi-Fi -> 3 pings succeed -> MQTT "ON"
 Wall switch OFF -> ESP loses power       -> 3 pings fail    -> MQTT "OFF"
 ```
 
-Off detection is about 300 ms (three missed pings at 100 ms). On detection is that same ~300 ms after the ESP finishes joining Wi-Fi.
+Off detection waits until **5 seconds have passed since the last successful ping**. A reply anywhere in that window keeps the switch ON, so brief Wi-Fi dropouts do not flicker lights. A real off should report in about 5 seconds.
 
 ## Hardware
 
@@ -93,9 +93,12 @@ Copy `nodes.example.json` to `nodes.json` and edit it:
     "client_id": "wall-switch-bridge"
   },
   "ping": {
-    "interval_s": 0.1,
-    "timeout_ms": 80,
-    "hits_to_switch": 3
+    "interval_s": 0.3,
+    "timeout_ms": 250,
+    "probes": 1,
+    "hits_to_on": 3,
+    "off_window_s": 5,
+    "min_on_s": 2
   },
   "nodes": [
     {
@@ -111,7 +114,7 @@ Copy `nodes.example.json` to `nodes.json` and edit it:
 - Leave `user` / `password` empty if the broker allows anonymous connections.
 - `host` must match that room’s ESP static IP.
 - MQTT topic defaults to `{id}/wall_switch/state` (override with `"topic"` if you want).
-- Three successful pings in a row publish `ON`. Three missed pings publish `OFF`.
+- Three successful checks in a row publish `ON`. `OFF` is published **5 seconds after the last successful ping** (`off_window_s`). One reply in that window keeps the node ON.
 
 `config.h` and `nodes.json` are gitignored so you do not publish credentials.
 
@@ -217,6 +220,7 @@ The bridge publishes an availability topic `wall_switch_bridge/status` (`online`
 | ESP LED keeps blinking | Wrong SSID/password, or the network is 5 GHz only |
 | `ping` from a PC fails | ESP is offline, wrong subnet, or Wi-Fi client isolation |
 | HA sensor stays off / unavailable | Bridge not running, MQTT not connected, or ESP not pingable |
+| Lights flicker without touching the switch | Raise `off_window_s` (try `8`) |
 | Works, then drops after a Wi-Fi rename | Reflash with the new SSID |
 | Docker cannot ping but the host can | Need `network_mode: host` and `cap_add: NET_RAW` |
 | Duplicate HA entities | Remove an old YAML MQTT sensor if discovery also created one |
