@@ -6,10 +6,11 @@ services:
     network_mode: host
     cap_add:
       - NET_RAW
+      - NET_ADMIN
     volumes:
       - ./:/app:ro
     working_dir: /app
     command: >
-      sh -c "apk add --no-cache iputils >/dev/null
-      && pip install --no-cache-dir -r requirements.txt >/dev/null
+      sh -c "apk add --no-cache iputils iputils-arping >/dev/null
+      && pip install --no-cache-dir 'paho-mqtt>=1.6.0' >/dev/null
       && python -u ping_mqtt_bridge.py"
