@@ -18,14 +18,23 @@ import json
 import logging
 import os
 import platform
+import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import paho.mqtt.client as mqtt
 
@@ -59,6 +68,16 @@ class PingSettings:
     hits_to_on: int = 3
     off_window_s: float = 5.0
     min_on_s: float = 2.0
+    use_arp: bool = True
+
+
+@dataclass
+class PingResult:
+    ok: bool
+    elapsed_ms: float
+    reason: str
+    detail: str = ""
+    returncode: int | None = None
 
 
 @dataclass
@@ -68,10 +87,20 @@ class Node:
     host: str
     topic: str
     consecutive_ok: int = 0
+    consecutive_fail: int = 0
     state: str | None = None
     last_on_at: float | None = None
     last_success_at: float | None = None
     first_seen_at: float | None = None
+    miss_started_at: float | None = None
+    last_off_at: float | None = None
+    last_ping: PingResult | None = None
+    recent_reasons: deque[str] = field(default_factory=lambda: deque(maxlen=20))
+    stats_ok: int = 0
+    stats_arp: int = 0
+    stats_miss: int = 0
+    consecutive_arp: int = 0
+    stats_started: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -107,6 +136,7 @@ def load_config(path: Path) -> tuple[MqttSettings, PingSettings, list[Node]]:
         hits_to_on=int(ping_raw.get("hits_to_on", legacy_hits if legacy_hits is not None else 3)),
         off_window_s=off_window_s,
         min_on_s=float(ping_raw.get("min_on_s", 2.0)),
+        use_arp=bool(ping_raw.get("use_arp", True)),
     )
 
     nodes: list[Node] = []
@@ -138,33 +168,322 @@ def load_config(path: Path) -> tuple[MqttSettings, PingSettings, list[Node]]:
     return mqtt_settings, ping_settings, nodes
 
 
-def ping_once(host: str, timeout_ms: int) -> bool:
+def _ping_detail(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    for line in reversed(lines):
+        lowered = line.lower()
+        if "time=" in lowered or "packet" in lowered or "unreachable" in lowered or "timed out" in lowered:
+            return line[:160]
+    return lines[-1][:160]
+
+
+def classify_ping(output: str, returncode: int | None, timed_out: bool) -> str:
+    text = output.lower()
+    if timed_out:
+        return "proc_timeout"
+    if "destination host unreachable" in text or "no route" in text:
+        return "unreachable"
+    if "unknown host" in text or "name or service not known" in text:
+        return "dns"
+    if "timed out" in text or "100% packet loss" in text or "0 received" in text:
+        return "no_reply"
+    if returncode == 0:
+        return "reply"
+    return f"rc={returncode}"
+
+
+def ping_once(host: str, timeout_ms: int) -> PingResult:
     timeout_s = max(timeout_ms / 1000.0, 0.05)
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
     else:
         cmd = ["ping", "-c", "1", "-W", f"{timeout_s:.3f}", host]
 
+    started = time.monotonic()
     try:
         result = subprocess.run(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             timeout=timeout_s + 0.15,
             check=False,
         )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log.debug("Ping error for %s: %s", host, exc)
-        return False
+        elapsed_ms = (time.monotonic() - started) * 1000
+        output = (result.stdout or "") + (result.stderr or "")
+        ok = result.returncode == 0
+        return PingResult(
+            ok=ok,
+            elapsed_ms=elapsed_ms,
+            reason="reply" if ok else classify_ping(output, result.returncode, False),
+            detail=_ping_detail(output),
+            returncode=result.returncode,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        output = ""
+        if exc.stdout:
+            output += exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", "replace")
+        if exc.stderr:
+            output += exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", "replace")
+        return PingResult(
+            ok=False,
+            elapsed_ms=elapsed_ms,
+            reason="proc_timeout",
+            detail=_ping_detail(output) or f"killed after {elapsed_ms:.0f}ms",
+            returncode=None,
+        )
+    except OSError as exc:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        return PingResult(
+            ok=False,
+            elapsed_ms=elapsed_ms,
+            reason="os_error",
+            detail=str(exc)[:160],
+        )
 
 
-def ping_check(host: str, timeout_ms: int, probes: int) -> bool:
+def ping_check(host: str, timeout_ms: int, probes: int) -> PingResult:
     """A check succeeds if any probe gets a reply."""
+    last = PingResult(ok=False, elapsed_ms=0, reason="no_probe")
     for _ in range(probes):
-        if ping_once(host, timeout_ms):
-            return True
-    return False
+        last = ping_once(host, timeout_ms)
+        if last.ok:
+            return last
+    return last
+
+
+_ARP_MISSING_LOGGED = False
+_ARP_IFACE_LOGGED = False
+_ARP_IFACE_CACHE: dict[str, tuple[str, bytes, bytes]] = {}
+_VIRTUAL_IFACE_PREFIXES = ("docker", "br-", "veth", "virbr", "cni", "flannel", "tun", "tap", "wg", "lo")
+SIOCGIFADDR = 0x8915
+SIOCGIFNETMASK = 0x891B
+ETH_P_ARP = 0x0806
+
+
+def _mac_bytes(mac: str) -> bytes:
+    return bytes(int(part, 16) for part in mac.split(":"))
+
+
+def _ipv4_ifaces() -> list[tuple[str, str, str, bytes]]:
+    """Return (name, ip, netmask, mac) for up IPv4 interfaces."""
+    if fcntl is None or not hasattr(socket, "AF_PACKET"):
+        return []
+    found: list[tuple[str, str, str, bytes]] = []
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for name in names:
+            if name == "lo":
+                continue
+            try:
+                req = struct.pack("256s", name.encode("utf-8")[:15])
+                ip = socket.inet_ntoa(fcntl.ioctl(sock, SIOCGIFADDR, req)[20:24])
+                mask = socket.inet_ntoa(fcntl.ioctl(sock, SIOCGIFNETMASK, req)[20:24])
+                mac = Path(f"/sys/class/net/{name}/address").read_text(encoding="utf-8").strip()
+                found.append((name, ip, mask, _mac_bytes(mac)))
+            except (OSError, ValueError):
+                continue
+    finally:
+        sock.close()
+    return found
+
+
+def _iface_for_host(host: str) -> tuple[str, bytes, bytes] | None:
+    cached = _ARP_IFACE_CACHE.get(host)
+    if cached:
+        return cached
+    try:
+        target = struct.unpack("!I", socket.inet_aton(host))[0]
+    except OSError:
+        return None
+    same_subnet: list[tuple[str, bytes, bytes]] = []
+    others: list[tuple[str, bytes, bytes]] = []
+    for name, ip, mask, mac in _ipv4_ifaces():
+        ip_n = struct.unpack("!I", socket.inet_aton(ip))[0]
+        mask_n = struct.unpack("!I", socket.inet_aton(mask))[0]
+        entry = (name, mac, socket.inet_aton(ip))
+        if (ip_n & mask_n) == (target & mask_n):
+            same_subnet.append(entry)
+        else:
+            others.append(entry)
+
+    def rank(item: tuple[str, bytes, bytes]) -> tuple[int, str]:
+        name = item[0]
+        virtual = name.startswith(_VIRTUAL_IFACE_PREFIXES)
+        return (1 if virtual else 0, name)
+
+    candidates = sorted(same_subnet, key=rank) or sorted(others, key=rank)
+    if not candidates:
+        return None
+    chosen = candidates[0]
+    _ARP_IFACE_CACHE[host] = chosen
+    return chosen
+
+
+def _linux_arp_once(host: str, timeout_ms: int) -> PingResult:
+    """Ask for the node's MAC. ESP8266 often answers ARP when ICMP is blackholed."""
+    global _ARP_IFACE_LOGGED
+    if fcntl is None or not hasattr(socket, "AF_PACKET"):
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_unsupported")
+
+    iface = _iface_for_host(host)
+    if iface is None:
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_no_iface")
+
+    ifname, src_mac, src_ip = iface
+    if not _ARP_IFACE_LOGGED:
+        log.info(
+            "ARP probe via %s src %s",
+            ifname,
+            socket.inet_ntoa(src_ip),
+        )
+        _ARP_IFACE_LOGGED = True
+
+    timeout_s = max(timeout_ms / 1000.0, 0.15)
+    dst_ip = socket.inet_aton(host)
+    packet = (
+        b"\xff" * 6
+        + src_mac
+        + struct.pack("!H", ETH_P_ARP)
+        + struct.pack(
+            "!HHBBH6s4s6s4s",
+            1,
+            0x0800,
+            6,
+            4,
+            1,
+            src_mac,
+            src_ip,
+            b"\x00" * 6,
+            dst_ip,
+        )
+    )
+    started = time.monotonic()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+        sock.bind((ifname, 0))
+        sock.send(packet)
+        deadline = started + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return PingResult(
+                    ok=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    reason="arp_fail",
+                    detail=f"no ARP reply on {ifname}",
+                )
+            sock.settimeout(remaining)
+            try:
+                data = sock.recv(256)
+            except (TimeoutError, socket.timeout):
+                return PingResult(
+                    ok=False,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    reason="arp_fail",
+                    detail=f"no ARP reply on {ifname}",
+                )
+            if len(data) < 42:
+                continue
+            if struct.unpack("!H", data[12:14])[0] != ETH_P_ARP:
+                continue
+            spa = data[28:32]
+            if spa == dst_ip:
+                return PingResult(
+                    ok=True,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    reason="arp_reply",
+                    detail=f"{ifname} {host}",
+                )
+    except OSError as exc:
+        _ARP_IFACE_CACHE.pop(host, None)
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_error", detail=str(exc)[:160])
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def arping_once(host: str, timeout_ms: int) -> PingResult:
+    arping = shutil.which("arping")
+    if not arping:
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_missing")
+
+    timeout_s = max(timeout_ms / 1000.0, 0.2)
+    deadline = max(1, int(round(timeout_s)))
+    cmd = [arping, "-c", "1", "-w", str(deadline)]
+    iface = _ARP_IFACE_CACHE.get(host)
+    if iface:
+        cmd.extend(["-I", iface[0]])
+    cmd.append(host)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=deadline + 0.3,
+            check=False,
+        )
+        elapsed_ms = (time.monotonic() - started) * 1000
+        output = (result.stdout or "") + (result.stderr or "")
+        text = output.lower()
+        ok = result.returncode == 0 or "unicast reply" in text or "bytes from" in text
+        return PingResult(
+            ok=ok,
+            elapsed_ms=elapsed_ms,
+            reason="arp_reply" if ok else "arp_fail",
+            detail=_ping_detail(output) or output.strip()[:160],
+            returncode=result.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        return PingResult(ok=False, elapsed_ms=elapsed_ms, reason="arp_timeout")
+    except OSError as exc:
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_error", detail=str(exc)[:160])
+
+
+def arp_check(host: str, timeout_ms: int) -> PingResult:
+    """ESP8266 often answers ARP when ICMP is blackholed."""
+    global _ARP_MISSING_LOGGED
+    if IS_WINDOWS:
+        return PingResult(ok=False, elapsed_ms=0, reason="arp_skip")
+
+    probe = _linux_arp_once(host, timeout_ms)
+    if probe.reason not in {"arp_unsupported", "arp_no_iface", "arp_error"}:
+        return probe
+
+    fallback = arping_once(host, timeout_ms)
+    if fallback.reason == "arp_missing" and not _ARP_MISSING_LOGGED:
+        log.warning(
+            "ARP probe failed (%s) and arping is not installed; "
+            "recreate the container so iputils-arping is available",
+            probe.reason,
+        )
+        _ARP_MISSING_LOGGED = True
+    if fallback.ok:
+        return fallback
+    if probe.reason != "arp_unsupported":
+        fallback.detail = f"{probe.reason}/{probe.detail or '-'} | {fallback.reason}".strip(" |")
+    return fallback
+
+
+def reach_check(host: str, timeout_ms: int, probes: int, use_arp: bool) -> PingResult:
+    ping = ping_check(host, timeout_ms, probes)
+    if ping.ok or not use_arp:
+        return ping
+    arp = arp_check(host, timeout_ms)
+    if arp.ok:
+        return arp
+    if arp.reason not in {"arp_skip", "arp_missing"}:
+        ping.detail = f"{ping.detail} | {arp.reason}".strip(" |")
+    return ping
 
 
 def discovery_topic(node: Node) -> str:
@@ -240,6 +559,40 @@ class Bridge:
     def _on_disconnect(self, client, userdata, *args):
         log.warning("MQTT disconnected; will retry")
 
+    def _reason_summary(self, node: Node) -> str:
+        counts = Counter(node.recent_reasons)
+        if not counts:
+            return "none"
+        return ", ".join(f"{reason} x{count}" for reason, count in counts.most_common())
+
+    def _silent_for(self, node: Node, now: float) -> float:
+        reference = node.last_success_at if node.last_success_at is not None else node.first_seen_at
+        if reference is None:
+            return 0.0
+        return max(0.0, now - reference)
+
+    def _log_stats_if_needed(self, node: Node, now: float) -> None:
+        if node.stats_started is None:
+            node.stats_started = now
+            return
+        if now - node.stats_started < 60:
+            return
+        total = node.stats_ok + node.stats_arp + node.stats_miss
+        miss_pct = 100.0 * node.stats_miss / total if total else 0.0
+        log.info(
+            "%s 1m stats: %s icmp / %s arp / %s miss (%.1f%% down) reasons: %s",
+            node.node_id,
+            node.stats_ok,
+            node.stats_arp,
+            node.stats_miss,
+            miss_pct,
+            self._reason_summary(node),
+        )
+        node.stats_ok = 0
+        node.stats_arp = 0
+        node.stats_miss = 0
+        node.stats_started = now
+
     def publish_state(self, node: Node, state: str) -> None:
         info = self.client.publish(node.topic, state, qos=1, retain=True)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -250,47 +603,134 @@ class Bridge:
     def watch_node(self, node: Node) -> None:
         settings = self.ping_settings
         log.info(
-            "Watching %s (%s) every %sms (on after %s hits, off %.0fs after last reply)",
+            "Watching %s (%s) every %sms (on after %s hits, off %.0fs after last ICMP/ARP, arp=%s)",
             node.name,
             node.host,
             int(settings.interval_s * 1000),
             settings.hits_to_on,
             settings.off_window_s,
+            "on" if settings.use_arp else "off",
         )
 
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
-                alive = ping_check(node.host, settings.timeout_ms, settings.probes)
+                ping = reach_check(
+                    node.host,
+                    settings.timeout_ms,
+                    settings.probes,
+                    settings.use_arp,
+                )
             except Exception:
                 log.exception("Unexpected ping failure for %s", node.node_id)
-                alive = False
+                ping = PingResult(ok=False, elapsed_ms=0, reason="exception")
 
             now = time.monotonic()
             with node.lock:
                 if node.first_seen_at is None:
                     node.first_seen_at = now
-                if alive:
+                if node.stats_started is None:
+                    node.stats_started = now
+                node.last_ping = ping
+                node.recent_reasons.append(ping.reason)
+
+                if ping.ok:
+                    was_failing = node.consecutive_fail > 0
+                    silent_for = self._silent_for(node, now)
+                    if ping.reason == "arp_reply":
+                        node.stats_arp += 1
+                        node.consecutive_arp += 1
+                        if node.consecutive_arp == 1 or node.consecutive_arp % 20 == 0:
+                            log.info(
+                                "%s ICMP blackout, ARP alive #%s %.0fms %s",
+                                node.node_id,
+                                node.consecutive_arp,
+                                ping.elapsed_ms,
+                                ping.detail or "-",
+                            )
+                    else:
+                        node.stats_ok += 1
+                        if node.consecutive_arp >= 3:
+                            log.info(
+                                "%s ICMP restored after %s ARP-only checks, rtt=%.0fms",
+                                node.node_id,
+                                node.consecutive_arp,
+                                ping.elapsed_ms,
+                            )
+                        node.consecutive_arp = 0
+                    if was_failing and (node.consecutive_fail >= 3 or silent_for >= 2.0):
+                        log.info(
+                            "%s recovered after %.1fs / %s misses (%s) rtt=%.0fms via %s",
+                            node.node_id,
+                            silent_for,
+                            node.consecutive_fail,
+                            self._reason_summary(node),
+                            ping.elapsed_ms,
+                            ping.reason,
+                        )
                     node.last_success_at = now
                     node.consecutive_ok += 1
+                    node.consecutive_fail = 0
+                    node.miss_started_at = None
                     if node.consecutive_ok >= settings.hits_to_on and node.state != "ON":
+                        off_for = (now - node.last_off_at) if node.last_off_at else 0.0
                         node.state = "ON"
                         node.last_on_at = now
+                        log.info(
+                            "%s publishing ON after %s hits, was off %.1fs, rtt=%.0fms",
+                            node.node_id,
+                            node.consecutive_ok,
+                            off_for,
+                            ping.elapsed_ms,
+                        )
                         self.publish_state(node, node.state)
                 else:
+                    node.stats_miss += 1
                     node.consecutive_ok = 0
+                    node.consecutive_fail += 1
+                    if node.miss_started_at is None:
+                        node.miss_started_at = now
+                    silent_for = self._silent_for(node, now)
+                    if node.state != "OFF" and (
+                        node.consecutive_fail == 1
+                        or node.consecutive_fail % 5 == 0
+                        or silent_for >= settings.off_window_s - 0.35
+                    ):
+                        log.info(
+                            "%s miss #%s silent=%.1fs/%ss %s %.0fms rc=%s %s",
+                            node.node_id,
+                            node.consecutive_fail,
+                            silent_for,
+                            settings.off_window_s,
+                            ping.reason,
+                            ping.elapsed_ms,
+                            ping.returncode,
+                            ping.detail or "-",
+                        )
 
                 reference = node.last_success_at if node.last_success_at is not None else node.first_seen_at
                 held_on = node.last_on_at is not None and (now - node.last_on_at) < settings.min_on_s
                 if (
                     node.state != "OFF"
-                    and not alive
+                    and not ping.ok
                     and not held_on
                     and reference is not None
                     and now - reference >= settings.off_window_s
                 ):
                     node.state = "OFF"
+                    node.last_off_at = now
+                    log.info(
+                        "%s publishing OFF silent=%.1fs misses=%s held_on=%s reasons: %s last=%s",
+                        node.node_id,
+                        now - reference,
+                        node.consecutive_fail,
+                        held_on,
+                        self._reason_summary(node),
+                        ping.detail or ping.reason,
+                    )
                     self.publish_state(node, node.state)
+
+                self._log_stats_if_needed(node, now)
 
             remaining = settings.interval_s - (time.monotonic() - started)
             if remaining > 0:
@@ -351,11 +791,12 @@ def main() -> int:
 
     log.info("Loaded %s node(s) from %s", len(nodes), CONFIG_PATH)
     log.info(
-        "Ping every %sms, timeout %sms, on after %s hits, off %.0fs after last reply",
+        "Ping every %sms, timeout %sms, on after %s hits, off %.0fs after last ICMP/ARP (arp %s)",
         int(ping_settings.interval_s * 1000),
         ping_settings.timeout_ms,
         ping_settings.hits_to_on,
         ping_settings.off_window_s,
+        "on" if ping_settings.use_arp else "off",
     )
     bridge = Bridge(mqtt_settings, ping_settings, nodes)
     signal.signal(signal.SIGINT, bridge.request_stop)

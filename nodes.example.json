@@ -12,7 +12,8 @@
     "probes": 1,
     "hits_to_on": 3,
     "off_window_s": 5,
-    "min_on_s": 2
+    "min_on_s": 2,
+    "use_arp": true
   },
   "nodes": [
     {

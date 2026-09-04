@@ -98,7 +98,8 @@ Copy `nodes.example.json` to `nodes.json` and edit it:
     "probes": 1,
     "hits_to_on": 3,
     "off_window_s": 5,
-    "min_on_s": 2
+    "min_on_s": 2,
+    "use_arp": true
   },
   "nodes": [
     {
@@ -114,7 +115,7 @@ Copy `nodes.example.json` to `nodes.json` and edit it:
 - Leave `user` / `password` empty if the broker allows anonymous connections.
 - `host` must match that room’s ESP static IP.
 - MQTT topic defaults to `{id}/wall_switch/state` (override with `"topic"` if you want).
-- Three successful checks in a row publish `ON`. `OFF` is published **5 seconds after the last successful ping** (`off_window_s`). One reply in that window keeps the node ON.
+- Three successful checks in a row publish `ON`. `OFF` is published **5 seconds after the last successful ping or ARP reply**. ESP8266 boards often drop ICMP while still answering ARP; the bridge treats either as proof the switch is on.
 
 `config.h` and `nodes.json` are gitignored so you do not publish credentials.
 
@@ -131,11 +132,11 @@ docker compose up -d
 docker logs -f wall-switch-bridge
 ```
 
-`restart: unless-stopped` brings it back after reboot. `network_mode: host` and `NET_RAW` are required so ICMP ping works.
+`restart: unless-stopped` brings it back after reboot. `network_mode: host`, `NET_RAW`, and `NET_ADMIN` are required so ICMP ping and ARP checks work.
 
 ### CasaOS / ZimaOS
 
-1. Copy this repo (or at least `ping_mqtt_bridge.py`, `nodes.json`, `requirements.txt`, and `docker-compose.yml`) to a folder such as `/DATA/AppData/wall-switch-bridge`.
+1. Copy this repo (or at least `ping_mqtt_bridge.py`, `nodes.json`, and `docker-compose.yml`) to a folder such as `/DATA/AppData/wall-switch-bridge`.
 2. If you use CasaOS app data, set the compose volume to that folder instead of `./`.
 3. Start the stack from **Install a customized app** or:
 
@@ -144,10 +145,16 @@ cd /DATA/AppData/wall-switch-bridge
 docker compose up -d
 ```
 
-After editing `nodes.json`:
+After editing `nodes.json` only:
 
 ```bash
 docker restart wall-switch-bridge
+```
+
+After copying a new `ping_mqtt_bridge.py` or `docker-compose.yml`:
+
+```bash
+docker compose up -d --force-recreate
 ```
 
 ### Python directly
@@ -220,7 +227,7 @@ The bridge publishes an availability topic `wall_switch_bridge/status` (`online`
 | ESP LED keeps blinking | Wrong SSID/password, or the network is 5 GHz only |
 | `ping` from a PC fails | ESP is offline, wrong subnet, or Wi-Fi client isolation |
 | HA sensor stays off / unavailable | Bridge not running, MQTT not connected, or ESP not pingable |
-| Lights flicker without touching the switch | Raise `off_window_s` (try `8`) |
+| Lights flicker without touching the switch | Confirm logs show `arp_reply` on ICMP misses; raise `off_window_s` if ARP also fails |
 | Works, then drops after a Wi-Fi rename | Reflash with the new SSID |
 | Docker cannot ping but the host can | Need `network_mode: host` and `cap_add: NET_RAW` |
 | Duplicate HA entities | Remove an old YAML MQTT sensor if discovery also created one |
